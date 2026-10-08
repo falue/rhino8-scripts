@@ -127,13 +127,13 @@ def matching_faces(face, face_type, surface_data):
 
 
 # ============================================================
-# PICK PREVIEW LOCATION
+# PICK POINT ON FACE
 # ============================================================
 
-def pick_preview_point(face):
+def pick_face_point(face, prompt):
 
     gp = ric.GetPoint()
-    gp.SetCommandPrompt("Click where you want the weave preview")
+    gp.SetCommandPrompt(prompt)
 
     gp.Constrain(face.Brep, -1, -1, False)
 
@@ -263,6 +263,71 @@ def strand_point(
     return sphere.Center + direction * (sphere.Radius + offset)
 
 
+def frame_coords(face_type, surface_data, frame, point):
+
+    # inverse of strand_point at offset 0: (coordinate along X, along Y)
+
+    if face_type == "plane":
+        v = point - frame.Origin
+        return v * frame.XAxis, v * frame.YAxis
+
+    d = point - surface_data.Center
+    d.Unitize()
+
+    z = 1.0 + d * frame.ZAxis
+
+    return (
+        2.0 * math.atan2(d * frame.XAxis, z),
+        2.0 * math.atan2(d * frame.YAxis, z)
+    )
+
+
+def patch_bounds(face_type, surface_data, frame, center, half, samples=64):
+
+    # (min, max) strand coordinates along X and Y covering all surface
+    # points within distance half of center; None = no limit
+
+    if face_type == "plane":
+
+        circle = rg.Circle(
+            rg.Plane(center, frame.XAxis, frame.YAxis),
+            half
+        )
+
+    else:
+
+        sphere = surface_data
+
+        # coordinates wrap around at the antipode
+        if center.DistanceTo(sphere.Center - frame.ZAxis * sphere.Radius) <= half:
+            return None
+
+        u = center - sphere.Center
+        u.Unitize()
+
+        a = 2.0 * math.asin(half / (2.0 * sphere.Radius))
+
+        circle = rg.Circle(
+            rg.Plane(sphere.Center + u * (sphere.Radius * math.cos(a)), u),
+            sphere.Radius * math.sin(a)
+        )
+
+    coords = [
+        frame_coords(
+            face_type,
+            surface_data,
+            frame,
+            circle.PointAt(2.0 * math.pi * i / samples)
+        )
+        for i in range(samples)
+    ]
+
+    return [
+        (min(c[axis] for c in coords), max(c[axis] for c in coords))
+        for axis in (0, 1)
+    ]
+
+
 def weave_wave(
     family,
     strand_index,
@@ -285,18 +350,18 @@ def create_weave_strands(
     faces,
     face_type,
     surface_data,
-    center,
+    origin,
     spacing,
     depth,
     height,
     angle,
-    patch_size=None
+    patch=None
 ):
 
-    # patch_size None = whole face
+    # patch: (center, size) of the preview patch, None = whole face
     # returns strands as lists of (yarn point, pill bottom point, normal)
 
-    frame = create_local_frame(faces[0], center, angle)
+    frame = create_local_frame(faces[0], origin, angle)
 
     if frame is None:
         return []
@@ -315,7 +380,6 @@ def create_weave_strands(
         sample_max = int(
             math.ceil(math.pi / step * PREVIEW_SAMPLES_PER_SEGMENT)
         ) - 1
-        mm_per_unit = sphere.Radius
 
     else:
 
@@ -329,29 +393,44 @@ def create_weave_strands(
 
         strand_max = int(math.ceil(extent / step))
         sample_max = strand_max * PREVIEW_SAMPLES_PER_SEGMENT
-        mm_per_unit = 1.0
 
-    if patch_size is not None:
+    bounds = None
 
+    if patch is not None:
+
+        patch_center, patch_size = patch
         half = patch_size * 0.5
-        limit = int(math.ceil(half / mm_per_unit / step))
 
-        strand_max = min(strand_max, limit)
-        sample_max = min(sample_max, limit * PREVIEW_SAMPLES_PER_SEGMENT)
+        bounds = patch_bounds(
+            face_type, surface_data, frame, patch_center, half
+        )
 
     sample_step = step / PREVIEW_SAMPLES_PER_SEGMENT
+
+    def index_range(axis, unit, limit):
+
+        if bounds is None:
+            return range(-limit, limit + 1)
+
+        lo, hi = bounds[axis]
+
+        return range(
+            max(-limit, math.floor(lo / unit)),
+            min(limit, math.ceil(hi / unit)) + 1
+        )
 
     strands = []
 
     for family in (0, 1):
 
-        for k in range(-strand_max, strand_max + 1):
+        # family 0 runs along X (t on X, c on Y), family 1 along Y
+        for k in index_range(1 - family, step, strand_max):
 
             c = k * step
 
             segments = [[]]
 
-            for m in range(-sample_max, sample_max + 1):
+            for m in index_range(family, sample_step, sample_max):
 
                 t = m * sample_step
 
@@ -360,7 +439,7 @@ def create_weave_strands(
                 )
 
                 inside = (
-                    (patch_size is None or base.DistanceTo(frame.Origin) <= half)
+                    (patch is None or base.DistanceTo(patch_center) <= half)
                     and any(point_is_on_face(f, base) for f in faces)
                 )
 
@@ -560,7 +639,7 @@ class WeaveDialog(forms.Dialog[bool]):
         faces,
         face_type,
         surface_data,
-        preview_center,
+        origin,
         conduit
     ):
 
@@ -569,7 +648,8 @@ class WeaveDialog(forms.Dialog[bool]):
         self.faces = faces
         self.face_type = face_type
         self.surface_data = surface_data
-        self.preview_center = preview_center
+        self.origin = origin
+        self.preview_center = origin
         self.conduit = conduit
 
         self.Title = "Weave Preview"
@@ -620,8 +700,12 @@ class WeaveDialog(forms.Dialog[bool]):
         # BUTTONS
         # ====================================================
 
+        self.btn_origin = forms.Button()
+        self.btn_origin.Text = "Set weave origin"
+        self.btn_origin.Click += self.on_set_origin
+
         self.btn_move = forms.Button()
-        self.btn_move.Text = "Move preview"
+        self.btn_move.Text = "Move preview center"
         self.btn_move.Click += self.on_move_preview
 
 
@@ -722,7 +806,7 @@ class WeaveDialog(forms.Dialog[bool]):
 
         layout.AddRow(None)
 
-        layout.AddRow(self.btn_move)
+        layout.AddRow(self.btn_origin, self.btn_move)
 
         layout.AddRow(None)
 
@@ -830,12 +914,12 @@ class WeaveDialog(forms.Dialog[bool]):
             self.faces,
             self.face_type,
             self.surface_data,
-            self.preview_center,
+            self.origin,
             spacing,
             depth,
             height,
             angle,
-            patch_size
+            (self.preview_center, patch_size)
         )
 
         self.conduit.set_geometry(
@@ -880,14 +964,30 @@ class WeaveDialog(forms.Dialog[bool]):
         self.update_preview()
 
 
-    def on_move_preview(self, sender, e):
+    def pick(self, prompt):
 
         # Hide the window temporarily so picking is pleasant
         self.Visible = False
 
-        p = pick_preview_point(self.faces[0])
+        p = pick_face_point(self.faces[0], prompt)
 
         self.Visible = True
+
+        return p
+
+
+    def on_set_origin(self, sender, e):
+
+        p = self.pick("Click the weave origin")
+
+        if p is not None:
+            self.origin = p
+            self.update_preview()
+
+
+    def on_move_preview(self, sender, e):
+
+        p = self.pick("Click the preview center")
 
         if p is not None:
             self.preview_center = p
@@ -914,7 +1014,7 @@ def generate_full_weave(
     faces,
     face_type,
     surface_data,
-    center,
+    origin,
     spacing,
     diameter,
     depth,
@@ -928,7 +1028,7 @@ def generate_full_weave(
         faces,
         face_type,
         surface_data,
-        center,
+        origin,
         spacing,
         depth,
         height,
@@ -987,9 +1087,11 @@ def main():
     )
 
 
-    center = pick_preview_point(face)
+    origin = pick_face_point(
+        face, "Click the weave origin (also the preview center)"
+    )
 
-    if center is None:
+    if origin is None:
         return
 
 
@@ -1004,7 +1106,7 @@ def main():
         faces,
         face_type,
         surface_data,
-        center,
+        origin,
         conduit
     )
 
@@ -1042,7 +1144,7 @@ def main():
             faces,
             face_type,
             surface_data,
-            dlg.preview_center,
+            dlg.origin,
             spacing,
             diameter,
             depth,
