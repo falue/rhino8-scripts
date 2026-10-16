@@ -135,7 +135,8 @@ def pick_face_point(face, prompt):
     gp = ric.GetPoint()
     gp.SetCommandPrompt(prompt)
 
-    gp.Constrain(face.Brep, -1, -1, False)
+    # untrimmed surface: points inside holes are allowed
+    gp.Constrain(face.UnderlyingSurface(), False)
 
     gp.Get()
 
